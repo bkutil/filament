@@ -309,11 +309,17 @@ module Filament
   end
 
   def self.run(app)
-    server = TCPServer.new('localhost', 9292)
+    host = ENV.fetch("HOST", "localhost")
+    port = ENV.fetch("PORT", 8080)
+
+    server = TCPServer.new(host, port)
     connection_handler = ConnectionHandler.new({ app: app })
 
     reactor = Reactor.new
     reactor.register(server, :read, connection_handler)
+
+    puts "Listening on #{host}:#{port}"
+
     reactor.run
   end
 end
