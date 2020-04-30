@@ -91,9 +91,7 @@ module Filament
           when :read
             chunk = read_request(context, socket)
             if chunk.nil?
-              puts "Client #{socket} is gone on read"
-              reactor.notify(:close, socket)
-              break
+              reactor.notify(:disconnect, socket)
             else
               process_request(context, chunk)
             end
@@ -102,8 +100,9 @@ module Filament
               run_app(context, socket)
               write_response(context, socket)
               reactor.notify(:disconnect, socket)
-              break
             end
+          when :stop
+            break
           end
 
           reactor, event, socket = Fiber.yield
@@ -255,6 +254,7 @@ module Filament
             reactor.register(client, :write, request_handler)
             reactor.register(client, :disconnect, self)
           when :disconnect
+            reactor.notify(socket, :stop)
             reactor.deregister(socket)
             socket.close
           end
