@@ -325,7 +325,17 @@ module Filament
 end
 
 app = Proc.new do |env|
-  [200, env.slice('SERVER_STATS'), ['OK']]
+  html=<<-EOF
+    <html>
+      <title>Hello from Filament HTTP server</title>
+      <body>
+      <h1>Hello</h1>
+      <p>Running on #{env['SERVER_SOFTWARE']}</p>
+      </body>
+    </html>
+  EOF
+
+  [200, {'Content-Type': "text/html"}, [html]]
 end
 
 Filament.run(app)
