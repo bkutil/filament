@@ -19,17 +19,15 @@ module Filament
     end
 
     def deregister(handle)
-      # puts "Deregistering #{handle}"
       @demuxer.remove(handle) 
       @handlers.delete(handle)
     end
 
     def notify(handle, event)
       # The client might have deregistered on read and we'd still get a
-      # writeable notify.
+      # notify from writeable.
       return unless @handlers[handle][event]
 
-      #puts "Notify #{handle} #{event}"
       @handlers[handle][event].call(self, event, handle)
     end
 
@@ -70,49 +68,59 @@ module Filament
     end
   end
 
-  class RequestHandler
-    def initialize(app)
+  class FiberHandler
+    attr_reader :context
+    Stop = Class.new(StandarError)
+
+    def initialize(context = {})
+      @context = context
       @handler = handler
-      @app = app
     end
 
-    def call(reactor, event, socket)
-      @handler.resume(reactor, event, socket) #if @handler.alive?
+    def call(reactor, event, handle)
+      @handler.resume(reactor, event, handle)
     end
 
     def handler
-      Fiber.new do |reactor, event, socket|
-        context = {
-          server_name: socket.local_address.getnameinfo[0],
-          server_port: socket.local_address.ip_port.to_s,
-          remote_addr: socket.remote_address.ip_address,
-          remote_port: socket.remote_address.ip_port.to_s
-        }
-
+      Fiber.new do |reactor, event, handle|
         loop do
-          case event
-          when :read
-            chunk = read_request(context, socket)
-            if chunk.nil?
-              # puts "Client #{socket} gone on read"
-              reactor.notify(socket, :disconnect)
-              break
-            else
-              process_request(context, chunk)
-            end
-          when :write
-            if read_done?(context)
-              run_app(context, socket)
-              write_response(context, socket)
-              # puts "Notifying server about client #{socket} disconnect"
-              reactor.notify(socket, :disconnect)
-              break
-            end
-          end
+          run(reactor, event, handle) || break
 
-          reactor, event, socket = Fiber.yield
+          reactor, event, handle = Fiber.yield
         end
       end
+    end
+    
+    # Returns false if should break the handler loop, true otherwise (catch is
+    # not available in mruby and exceptions might be too heavy)
+    def run(reactor, event, handle)
+      raise "Override me"
+    end
+  end
+
+  class RequestHandler < FiberHandler
+    def run(reactor, event, handle)
+      case event
+      when :read
+        chunk = read_request(context, handle)
+        if chunk.nil?
+          # puts "Client #{socket} gone on read"
+          reactor.notify(handle, :disconnect)
+          return false
+        else
+          process_request(context, chunk)
+        end
+      when :write
+        if read_done?(context)
+          run_app(context, handle)
+          write_response(context, handle)
+          # puts "Notifying server about client #{socket} disconnect"
+          reactor.notify(handle, :disconnect)
+          return false
+        end
+      end
+
+      true
     end
 
     def read_request(context, socket)
@@ -132,7 +140,7 @@ module Filament
 
     def process_request(context, chunk)
       context[:request_buffer] ||= ""
-      context[:request_buffer] += chunk.to_s
+      context[:request_buffer] += chunk
       if chunk == "\r\n" || chunk == "\n"
         consume_headers(context)
       end
@@ -149,7 +157,7 @@ module Filament
 
     def run_app(context, socket)
       env = rack_env(socket, context[:request_buffer]) 
-      status, headers, body = @app.call(env)
+      status, headers, body = context[:app].call(env)
       context[:response_buffer] = response(status, headers, body)
     end
 
@@ -241,40 +249,35 @@ module Filament
     end
   end
 
-  class ConnectionHandler
-    def initialize(app)
-      @handler = handler
-      @app = app
-    end
+  class ConnectionHandler < FiberHandler
+    def run(reactor, event, handle)
+      case event
+      when :read
+        client = handle.accept_nonblock
 
-    def call(reactor, event, socket)
-      @handler.resume(reactor, event, socket) #if @handler.alive?
-    end
+        client_context = {
+          server_name: client.local_address.getnameinfo[0],
+          server_port: client.local_address.ip_port.to_s,
+          remote_addr: client.remote_address.ip_address,
+          remote_port: client.remote_address.ip_port.to_s
+        }.merge(context)
 
-    def handler
-      Fiber.new do |reactor, event, socket|
-        loop do
-          case event
-          when :read
-            client = socket.accept_nonblock
-            request_handler = RequestHandler.new(@app)
-            reactor.register(client, :read, request_handler)
-            reactor.register(client, :write, request_handler)
-            reactor.register(client, :disconnect, self)
-          when :disconnect
-            reactor.deregister(socket)
-            socket.close
-          end
-
-          reactor, event, socket = Fiber.yield
-        end
+        request_handler = RequestHandler.new(client_context)
+        reactor.register(client, :read, request_handler)
+        reactor.register(client, :write, request_handler)
+        reactor.register(client, :disconnect, self)
+      when :disconnect
+        reactor.deregister(handle)
+        handle.close
       end
+
+      true
     end
   end
 
   def self.run(app)
     server = TCPServer.new('localhost', 9292)
-    connection_handler = ConnectionHandler.new(app)
+    connection_handler = ConnectionHandler.new({ app: app })
 
     reactor = Reactor.new
     reactor.register(server, :read, connection_handler)
