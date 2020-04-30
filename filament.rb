@@ -232,6 +232,7 @@ module Filament
         'rack.url_scheme' => 'http',
 
         'SERVER_SOFTWARE' => "Filament/0.0.1 (MRuby/#{RUBY_VERSION})",
+        'APP_REQUEST_START' => Time.now.to_f,
         'SCRIPT_NAME' => ''
       }
     end
@@ -309,8 +310,8 @@ module Filament
   end
 
   def self.run(app)
-    host = ENV.fetch("HOST", "localhost")
-    port = ENV.fetch("PORT", 8080)
+    host = ENV.fetch("HTTP_HOST", "localhost")
+    port = ENV.fetch("HTTP_PORT", 8080)
 
     server = TCPServer.new(host, port)
     connection_handler = ConnectionHandler.new({ app: app })
@@ -325,17 +326,19 @@ module Filament
 end
 
 app = Proc.new do |env|
-  html=<<-EOF
+  index=<<-EOF
     <html>
       <title>Hello from Filament HTTP server</title>
       <body>
       <h1>Hello</h1>
       <p>Running on #{env['SERVER_SOFTWARE']}</p>
+      <p>Processing took #{((Time.now.to_f - env['APP_REQUEST_START']) * 1000.0).round(5)}ms.</p>
+      <p>Feel free to read the <a href="/_source">source code</a>.
       </body>
     </html>
   EOF
 
-  [200, {'Content-Type': "text/html"}, [html]]
+  [200, {'Content-Type': "text/html"}, [index]]
 end
 
 Filament.run(app)
