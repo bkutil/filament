@@ -1,6 +1,7 @@
 src/mruby
 src/nio4r
 src/main.rb
+src/mrb_wrapper.rb
 bin/*
 *.swp
 *.swo
