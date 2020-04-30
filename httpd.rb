@@ -254,15 +254,8 @@ module Filament
       case event
       when :read
         client = handle.accept_nonblock
+        request_handler = RequestHandler.new(client_context(client))
 
-        client_context = {
-          server_name: client.local_address.getnameinfo[0],
-          server_port: client.local_address.ip_port.to_s,
-          remote_addr: client.remote_address.ip_address,
-          remote_port: client.remote_address.ip_port.to_s
-        }.merge(context)
-
-        request_handler = RequestHandler.new(client_context)
         reactor.register(client, :read, request_handler)
         reactor.register(client, :write, request_handler)
         reactor.register(client, :disconnect, self)
@@ -272,6 +265,17 @@ module Filament
       end
 
       true
+    end
+
+    private
+
+    def client_context(client)
+      {
+        server_name: client.local_address.getnameinfo[0],
+        server_port: client.local_address.ip_port.to_s,
+        remote_addr: client.remote_address.ip_address,
+        remote_port: client.remote_address.ip_port.to_s
+      }.merge(context)
     end
   end
 
