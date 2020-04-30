@@ -1,4 +1,10 @@
 #!/usr/bin/env ruby
+#  Dependencies:
+#
+#  conf.gem :github => 'Asmod4n/mruby-phr'
+#  conf.gem :core => 'mruby-io'
+#  conf.gem :core => 'mruby-socket'
+#  conf.gem :github => 'iij/mruby-env'
 
 if RUBY_ENGINE != "mruby"
   require 'socket'
