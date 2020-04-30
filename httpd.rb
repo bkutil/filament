@@ -157,38 +157,62 @@ module Filament
     def run_app(context, socket)
       env = rack_env(socket, context[:request_buffer]) 
       status, headers, body = context[:app].call(env)
-      context[:response_buffer] = response(status, headers, body)
+      context[:response_buffer] = Http::Response.new(status, headers, body).to_s
     end
 
-    def response(status, headers, body)
-      status = "HTTP/1.1 #{status}\r\n"
-      head = ""
+    module Http
+      class Response
+        def initialize(status, headers, body)
+          @status = "HTTP/1.1 #{status}"
+          @body = body.join
+          @headers = serialize_headers(headers.merge(content_length))
+        end
 
-      headers.each do |name,values|
-        case values
-        when String
-          values.each_line("\n") do |value|
-            head += "#{name}: #{value.chomp}\r\n"
-          end
-        when Time
-          head += "#{name}: #{values.httpdate}\r\n"
-        when Array
-          values.each do |value|
-            head += "#{name}: #{value}\r\n"
+        def headers
+          "#{@status}\r\n#{@headers}\r\n"
+        end
+
+        def body
+          @body
+        end
+
+        def to_s
+          "#{headers}#{body}"
+        end
+
+        private
+
+        def content_length
+          if @body.empty?
+            {}
+          else
+            { "Content-Length" => @body.bytesize.to_s }
           end
         end
+
+        def serialize_headers(headers)
+          head = ""
+
+          headers.each do |name, values|
+            case values
+            when String
+              values.each_line("\n") do |value|
+                head += "#{name}: #{value.chomp}\r\n"
+              end
+            when Time
+              # This is not RFC compliant, but mruby does not have
+              # #strftime on Time to produce #httpdate.
+              head += "#{name}: #{values.to_i}\r\n"
+            when Array
+              values.each do |value|
+                head += "#{name}: #{value}\r\n"
+              end
+            end
+          end
+
+          head
+        end
       end
-
-      main = ""
-
-      body.each do |chunk|
-        main += chunk
-      end
-
-      head += "Content-Length: #{main.bytesize}\r\n"
-      head += "\r\n"
-
-      status + head + main
     end
 
     def rack_env(socket, body)
