@@ -6,228 +6,277 @@ if RUBY_ENGINE != "mruby"
   require 'pico_http_parser'
 end
 
-class HttpServer
-  def initialize(app, options)
-    @app = app
-    @options = options
+module Filament
+  class Reactor
+    def initialize
+      @handlers = Hash.new { |h, k| h[k] = {} }
+      @demuxer = Demuxer.new(self)
+    end
 
-    @reading = []
-    @writing = []
+    def register(handle, event, handler)
+      @handlers[handle][event] = handler
+      @demuxer.add(handle)
+    end
 
-    @clients = {}
-    @requests = {}
+    def deregister(handle)
+      @demuxer.remove(handle) 
+      @handlers.delete(handle)
+    end
+
+    def notify(handle, event)
+      # The client might have deregistered on read and we'd still get a
+      # writeable notify.
+      return unless @handlers.key?(handle)
+      @handlers[handle][event].call(self, event, handle)
+    end
+
+    def run
+      @demuxer.run
+    end
   end
 
-  def self.run(app, options = {})
-    new(app, options).run
+  class Demuxer
+    def initialize(dispatcher)
+      @dispatcher = dispatcher
+      @readers = []
+      @writers = []
+    end
+
+    def add(handle)
+      @readers << handle unless @readers.include?(handle)
+      @writers << handle unless @writers.include?(handle)
+    end
+
+    def remove(handle)
+      @readers.delete(handle)
+      @writers.delete(handle)
+    end
+
+    def run
+      loop do
+        readable, writable = IO.select(@readers, @writers)
+
+        readable.each do |handle|
+          @dispatcher.notify(handle, :read)
+        end
+
+        writable.each do |handle|
+          @dispatcher.notify(handle, :write)
+        end
+      end
+    end
   end
 
-  def run
-    @server_socket = TCPServer.new('localhost', 9292)
-    @reading.push(@server_socket)
-    start
-  rescue Exception => e
-    puts "#{e.class} #{e.message}"
-    puts e.backtrace.join("\n")
-    raise
-  end
+  class RequestHandler
+    def initialize(app)
+      @handler = handler
+      @app = app
+    end
 
-  def handler(socket)
-    Fiber.new do |response|
-      begin
+    def call(reactor, event, socket)
+      @handler.resume(reactor, event, socket)
+    end
+
+    def handler
+      Fiber.new do |reactor, event, socket|
+        context = {
+          server_name: socket.local_address.getnameinfo[0],
+          server_port: socket.local_address.ip_port.to_s,
+          remote_addr: socket.remote_address.ip_address,
+          remote_port: socket.remote_address.ip_port.to_s
+        }
+
         loop do
-          if response.nil?
-            req = @requests[socket]
-            request = if req[:body_size]
-              socket.gets(req[:body_size])
+          case event
+          when :read
+            chunk = read_request(context, socket)
+            if chunk.nil?
+              puts "Client #{socket} is gone on read"
+              reactor.notify(:close, socket)
+              break
             else
-              socket.gets
+              process_request(context, chunk)
             end
-            socket.flush
-            response = Fiber.yield(request)
-          else
-            socket.write response
-            socket.flush
-            response = Fiber.yield
+          when :write
+            if context[:read_done]
+              run_app(context, socket)
+              write_response(context, socket)
+              reactor.notify(:disconnect, socket)
+              break
+            end
           end
-        end
-      rescue Exception => e
-        puts "Error in Fiber loop #{e.class} #{e.message}"
-        raise
-      end
-    end
-  end
 
-  def add_client
-    socket = @server_socket.accept_nonblock
-    remote_addr = socket.remote_address
-    local_addr = socket.local_address
-
-    @reading.push(socket)
-    @clients[socket] = handler(socket)
-    @requests[socket] = {
-      buffer: "",
-      headers: {},
-      server_name: local_addr.getnameinfo[0],
-      server_port: local_addr.ip_port.to_s,
-      remote_addr: remote_addr.ip_address,
-      remote_port: remote_addr.ip_port.to_s
-    }
-  end
-
-  def remove_client(socket)
-    @reading.delete(socket)
-    @clients.delete(socket)
-    @requests.delete(socket)
-    socket.flush
-    socket.close
-  end
-
-  def rack_env(socket, body)
-    {
-      'rack.input' => body,
-      'rack.version' => "1.4.0", #Rack::VERSION,
-      'rack.errors' => $stderr,
-      'rack.multithread' => false,
-      'rack.multiprocess' => false,
-      'rack.run_once' => false,
-      'rack.url_scheme' => 'http',
-
-      'SERVER_SOFTWARE' => "HTTPServer/0.0.1 (MRuby/#{RUBY_VERSION})",
-      'SCRIPT_NAME' => ''
-    }
-  end
-
-  def response(status, headers, body)
-    response = ""
-    response += "HTTP/1.1 #{status}\r\n"
-
-    headers.each do |name,values|
-      case values
-      when String
-        values.each_line("\n") do |value|
-          response += "#{name}: #{value.chomp}\r\n"
-        end
-      when Time
-        response += "#{name}: #{values.httpdate}\r\n"
-      when Array
-        values.each do |value|
-          response += "#{name}: #{value}\r\n"
+          reactor, event, socket = Fiber.yield
         end
       end
     end
 
-    response += "\r\n"
-
-    body.each do |chunk|
-      response += chunk
+    def read_request(context, socket)
+      socket.gets(context[:content_length] ? context[:socket_length] : "\r\n")
     end
 
-    response
-  end
+    def process_request(context, chunk)
+      context[:request_buffer] ||= ""
+      context[:request_buffer] += chunk.to_s
 
-  def process(socket, request)
-    env = rack_env(socket, request[:buffer]) 
-    status, headers, body = @app.call(env)
-    response(status, headers, body)
-  end
-
-  def parse_headers(request)
-    if RUBY_ENGINE == "mruby"
-      parser = Phr.new
-      parser.parse_request(request[:buffer])
-
-      parser.headers.each do |name, val|
-        key = name.dup
-        key.upcase!
-        key.tr('-', '_')
-
-        unless ['content-type', 'content-length'].include?(name)
-          key = "HTTP_#{key}"
-        end
-
-        request[:headers][key] = val.is_a?(Array) ? val.join("\n") : val.to_s
-      end
-
-      request[:method] = parser.method.to_s
-      request[:path] = parser.path.split("?", 2)[0].to_s
-      request[:query_string] = parser.path.split("?", 2)[1].to_s
-      request[:body_size] = request[:headers]["CONTENT_LENGTH"].to_i
-      request[:server_protocol] = parser.minor_version
-
-      parser.reset
-    else
-      headers = {}
-
-      PicoHTTPParser.parse_http_request(request[:buffer], headers)
-      
-      request[:headers] = headers
-      request[:method] = headers["REQUEST_METHOD"]
-      request[:path] = headers["PATH_INFO"]
-      request[:query_string] = headers["QUERY_STRING"]
-      request[:body_size] = headers["CONTENT_LENGTH"].to_i
-      request[:server_protocol] = headers['SERVER_PROTOCOL']
-    end
-  end
-
-  def start
-    puts "Starting HTTP server on localhost:9292"
-
-    loop do
-      readable, writable = IO.select(@reading)
-
-      readable.each do |socket|
-        if socket == @server_socket
-          add_client
+      consume_headers(context) if chunk == "\r\n" || chunk == "\n"
+        
+      context[:read_done] = case context[:method]
+        when "GET"
+          true
+        when "POST"
+          context[:request_buffer].bytesize == context[:content_length] 
         else
-          handler = @clients[socket]
-          req = @requests[socket]
+          false
+        end
+    end
 
-          chunk = handler.resume
+    def write_response(context, socket)
+      ret = socket.write context[:response_buffer]
+      if ret.nil? || ret < 0
+	      puts "Client is gone on write"
+      else
+	      socket.flush
+      end
+    end
 
-          # Client disconnected 
-          if chunk.nil?
-            remove_client(socket)
-            next 
+    def run_app(context, socket)
+      env = rack_env(socket, context[:request_buffer]) 
+      status, headers, body = @app.call(env)
+      context[:response_buffer] = response(status, headers, body)
+    end
+
+    def response(status, headers, body)
+      status = "HTTP/1.1 #{status}\r\n"
+      head = ""
+
+      headers.each do |name,values|
+        case values
+        when String
+          values.each_line("\n") do |value|
+            head += "#{name}: #{value.chomp}\r\n"
+          end
+        when Time
+          head += "#{name}: #{values.httpdate}\r\n"
+        when Array
+          values.each do |value|
+            head += "#{name}: #{value}\r\n"
+          end
+        end
+      end
+
+      main = ""
+
+      body.each do |chunk|
+        main += chunk
+      end
+
+      head += "Content-Length: #{main.bytesize}\r\n"
+      head += "\r\n"
+
+      status + head + main
+    end
+
+    def rack_env(socket, body)
+      {
+        'rack.input' => body,
+        'rack.version' => "1.4.0", #Rack::VERSION,
+        'rack.errors' => $stderr,
+        'rack.multithread' => false,
+        'rack.multiprocess' => false,
+        'rack.run_once' => false,
+        'rack.url_scheme' => 'http',
+
+        'SERVER_SOFTWARE' => "HTTPServer/0.0.1 (MRuby/#{RUBY_VERSION})",
+        'SCRIPT_NAME' => ''
+      }
+    end
+
+    def consume_headers(request)
+      if RUBY_ENGINE == "mruby"
+        parser = Phr.new
+        parser.parse_request(request[:request_buffer])
+        request[:headers] = {}
+
+        parser.headers.each do |name, val|
+          key = name.dup
+          key.upcase!
+          key.tr!('-', '_')
+
+          unless ['content-type', 'content-length'].include?(name)
+            key = "HTTP_#{key}"
           end
 
-          req[:buffer] += chunk
+          request[:headers][key] = val.is_a?(Array) ? val.join("\n") : val.to_s
+        end
 
-          # Got complete headers
-          if chunk == "\r\n"
-            parse_headers(req) 
-            req[:buffer] = ""
+        request[:method] = parser.method.to_s
+        request[:path] = parser.path.split("?", 2)[0].to_s
+        request[:query_string] = parser.path.split("?", 2)[1].to_s
+        request[:content_length] = request[:headers]["CONTENT_LENGTH"].to_i
+        request[:server_protocol] = parser.minor_version
+
+        parser.reset
+      else
+        headers = {}
+
+        PicoHTTPParser.parse_http_request(request[:request_buffer], headers)
+
+        request[:headers] = headers
+        request[:method] = headers["REQUEST_METHOD"]
+        request[:path] = headers["PATH_INFO"]
+        request[:query_string] = headers["QUERY_STRING"]
+        request[:content_length] = headers["CONTENT_LENGTH"].to_i
+        request[:server_protocol] = headers['SERVER_PROTOCOL']
+      end
+
+      request[:request_buffer] = ""
+    end
+  end
+
+  class ConnectionHandler
+    def initialize(app)
+      @handler = handler
+      @app = app
+    end
+
+    def call(reactor, event, socket)
+      @handler.resume(reactor, event, socket)
+    end
+
+    def handler
+      Fiber.new do |reactor, event, socket|
+        loop do
+          case event
+          when :read
+            client = socket.accept_nonblock
+            request_handler = RequestHandler.new(@app)
+            reactor.register(client, :read, request_handler)
+            reactor.register(client, :write, request_handler)
+            reactor.register(client, :disconnect, self)
+          when :disconnect
+            reactor.deregister(socket)
+            socket.close
           end
 
-          case req[:method]
-          when "GET", "OPTIONS", "HEAD", "CONNECT"
-            response = process(socket, req)
-            handler.resume(response)
-            remove_client(socket)
-          when "POST", "PUT"
-            # Got complete headers, see what's next
-            if req[:buffer].empty?
-              next
-            elsif req[:buffer].bytesize < req[:body_size]
-              next
-            else
-              # Got complete body, call the app
-              response = process(socket, req)
-              handler.resume(response)
-              remove_client(socket)
-            end
-          else
-            # NOOP
-          end
-
+          reactor, event, socket = Fiber.yield
         end
       end
     end
+  end
+
+  def self.run(app)
+    server = TCPServer.new('localhost', 9292)
+    connection_handler = ConnectionHandler.new(app)
+
+    reactor = Reactor.new
+    reactor.register(server, :read, connection_handler)
+    reactor.run
   end
 end
 
 app = Proc.new do |env|
-  [200, {}, ['OK']]
+  [200, env.slice('SERVER_STATS'), ['OK']]
 end
 
-HttpServer.run(app)
+Filament.run(app)
