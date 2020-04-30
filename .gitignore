@@ -1,7 +1,7 @@
 src/mruby
 src/nio4r
 src/main.rb
-src/mrb_wrapper.rb
+src/mrb_bytecode.c
 bin/*
 *.swp
 *.swo
