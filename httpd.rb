@@ -156,7 +156,6 @@ module Filament
 
     def run_app(context, socket)
       env = rack_env(socket, context[:request_buffer]) 
-      p env
       status, headers, body = context[:app].call(env)
       context[:response_buffer] = response(status, headers, body)
     end
