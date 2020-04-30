@@ -19,6 +19,7 @@ module Filament
     end
 
     def deregister(handle)
+      # puts "Deregistering #{handle}"
       @demuxer.remove(handle) 
       @handlers.delete(handle)
     end
@@ -26,7 +27,9 @@ module Filament
     def notify(handle, event)
       # The client might have deregistered on read and we'd still get a
       # writeable notify.
-      return unless @handlers.key?(handle)
+      return unless @handlers[handle][event]
+
+      #puts "Notify #{handle} #{event}"
       @handlers[handle][event].call(self, event, handle)
     end
 
@@ -74,7 +77,7 @@ module Filament
     end
 
     def call(reactor, event, socket)
-      @handler.resume(reactor, event, socket)
+      @handler.resume(reactor, event, socket) #if @handler.alive?
     end
 
     def handler
@@ -91,18 +94,20 @@ module Filament
           when :read
             chunk = read_request(context, socket)
             if chunk.nil?
-              reactor.notify(:disconnect, socket)
+              # puts "Client #{socket} gone on read"
+              reactor.notify(socket, :disconnect)
+              break
             else
               process_request(context, chunk)
             end
           when :write
-            if context[:read_done]
+            if read_done?(context)
               run_app(context, socket)
               write_response(context, socket)
-              reactor.notify(:disconnect, socket)
+              # puts "Notifying server about client #{socket} disconnect"
+              reactor.notify(socket, :disconnect)
+              break
             end
-          when :stop
-            break
           end
 
           reactor, event, socket = Fiber.yield
@@ -114,26 +119,29 @@ module Filament
       socket.gets(context[:content_length] ? context[:content_length] : "\r\n")
     end
 
+    def read_done?(context)
+      case context[:method]
+      when "GET"
+        true
+      when "POST"
+        context[:request_buffer].bytesize == context[:content_length] 
+      else
+        false
+      end
+    end
+
     def process_request(context, chunk)
       context[:request_buffer] ||= ""
       context[:request_buffer] += chunk.to_s
-
-      consume_headers(context) if chunk == "\r\n" || chunk == "\n"
-        
-      context[:read_done] = case context[:method]
-        when "GET"
-          true
-        when "POST"
-          context[:request_buffer].bytesize == context[:content_length] 
-        else
-          false
-        end
+      if chunk == "\r\n" || chunk == "\n"
+        consume_headers(context)
+      end
     end
 
     def write_response(context, socket)
       ret = socket.write context[:response_buffer]
       if ret.nil? || ret < 0
-	      puts "Client is gone on write"
+	      # puts "Client is gone on write"
       else
 	      socket.flush
       end
@@ -240,7 +248,7 @@ module Filament
     end
 
     def call(reactor, event, socket)
-      @handler.resume(reactor, event, socket)
+      @handler.resume(reactor, event, socket) #if @handler.alive?
     end
 
     def handler
@@ -254,7 +262,6 @@ module Filament
             reactor.register(client, :write, request_handler)
             reactor.register(client, :disconnect, self)
           when :disconnect
-            reactor.notify(socket, :stop)
             reactor.deregister(socket)
             socket.close
           end
