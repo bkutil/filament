@@ -70,7 +70,6 @@ module Filament
 
   class FiberHandler
     attr_reader :context
-    Stop = Class.new(StandarError)
 
     def initialize(context = {})
       @context = context
@@ -157,6 +156,7 @@ module Filament
 
     def run_app(context, socket)
       env = rack_env(socket, context[:request_buffer]) 
+      p env
       status, headers, body = context[:app].call(env)
       context[:response_buffer] = response(status, headers, body)
     end
@@ -202,7 +202,7 @@ module Filament
         'rack.run_once' => false,
         'rack.url_scheme' => 'http',
 
-        'SERVER_SOFTWARE' => "HTTPServer/0.0.1 (MRuby/#{RUBY_VERSION})",
+        'SERVER_SOFTWARE' => "Filament/0.0.1 (MRuby/#{RUBY_VERSION})",
         'SCRIPT_NAME' => ''
       }
     end
