@@ -112,7 +112,7 @@ module Filament
     end
 
     def read_request(context, socket)
-      socket.gets(context[:content_length] ? context[:socket_length] : "\r\n")
+      socket.gets(context[:content_length] ? context[:content_length] : "\r\n")
     end
 
     def process_request(context, chunk)
