@@ -1,9 +1,9 @@
-bin: src/mrb_bytecode.c src/mrb_wrapper.c
-	musl-gcc -std=c99 -static -Isrc/mruby/include src/mrb_wrapper.c src/mruby/build/host/lib/libmruby.a -o bin/hello
-	strip -g bin/hello
-	upx -7 bin/hello
+bin/filament: src/mrb_bytecode.c src/mrb_wrapper.c
+	musl-gcc -std=c99 -static -Isrc/mruby/include src/mrb_wrapper.c src/mruby/build/host/lib/libmruby.a -o bin/filament
+	strip -g bin/filament
+	upx -7 bin/filament
 
-src/mrb_bytecode.c: src/main.rb src/mruby/build/host/bin/mrbc
+src/mrb_bytecode.c: src/main.rb
 	src/mruby/build/host/bin/mrbc -Bmrb_bytecode -o src/mrb_bytecode.c src/main.rb
 
 src/mruby/build/host/bin/mrbc: src/mruby
