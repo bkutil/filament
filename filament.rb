@@ -6,13 +6,9 @@
 #  conf.gem :core => 'mruby-socket'
 #  conf.gem :github => 'iij/mruby-env'
 
-if RUBY_ENGINE != "mruby"
-  require 'socket'
-  require 'byebug'
-  require 'pico_http_parser'
-end
-
 module Filament
+  VERSION = "0.0.1"
+
   class Reactor
     def initialize
       @handlers = Hash.new { |h, k| h[k] = {} }
@@ -96,10 +92,142 @@ module Filament
       end
     end
     
-    # Returns false if should break the handler loop, true otherwise (catch is
-    # not available in mruby and exceptions might be too heavy)
+    # Returning false/nil breaks out of the handler loop (catch is not available in
+    # mruby and exceptions might be too heavy)
     def run(reactor, event, handle)
       raise "Override me"
+    end
+  end
+
+  module Http
+    class Response
+      def initialize(status, headers, body)
+        @status = "HTTP/1.1 #{status}"
+        @body = body.join
+        @headers = serialize_headers(headers.merge(content_length))
+      end
+
+      def headers
+        "#{@status}\r\n#{@headers}\r\n"
+      end
+
+      def body
+        @body
+      end
+
+      def to_s
+        "#{headers}#{body}"
+      end
+
+      private
+
+      def content_length
+        if @body.empty?
+          {}
+        else
+          { "Content-Length" => @body.bytesize.to_s }
+        end
+      end
+
+      def serialize_headers(headers)
+        head = ""
+
+        headers.each do |name, values|
+          case values
+          when String
+            values.each_line("\n") do |value|
+              head += "#{name}: #{value.chomp}\r\n"
+            end
+          when Time
+            # This is not RFC compliant, but mruby does not have
+            # #strftime on Time to produce #httpdate.
+            head += "#{name}: #{values.to_i}\r\n"
+          when Array
+            values.each do |value|
+              head += "#{name}: #{value}\r\n"
+            end
+          end
+        end
+
+        head
+      end
+    end
+
+    class Request
+      attr_reader :headers, :info, :body
+
+      def initialize
+        @info = {}
+
+        @headers = {}
+        @headers_complete = false
+
+        @header = ""
+        @body = ""
+      end
+
+      def complete?
+        case @info['METHOD']
+        when "GET"
+          true
+        when "POST"
+          @body.bytesize == @headers['CONTENT_LENGTH']
+        else
+          false
+        end
+      end
+
+      def <<(chunk)
+        if @headers_complete
+          @body += chunk
+        else
+          @header += chunk
+
+          if chunk == "\r\n" || chunk == "\n"
+            @headers, @info = parse_headers(@header)
+            @headers_complete = true
+          end
+        end
+      end
+
+      private
+
+      def parse_headers(header_string)
+        parser = Phr.new
+        parser.parse_request(header_string)
+
+        headers = normalize_headers(parser.headers)
+        info = extract_info(parser)
+
+        parser.reset
+        
+        [headers, info]
+      end
+
+      def extract_info(parser)
+        {
+          "METHOD" => parser.method.to_s,
+          "PATH" => parser.path.split("?", 2)[0].to_s,
+          "QUERY_STRING" => parser.path.split("?", 2)[1].to_s,
+          "SERVER_PROTOCOL" => parser.minor_version
+        }
+      end
+
+      def normalize_headers(headers)
+        normalized = {}
+
+        headers.each do |name, val|
+          key = name.upcase.tr('-', '_')
+
+          unless ['content-type', 'content-length'].include?(name)
+            key = "HTTP_#{key}"
+          end
+
+          normalized[key] = val.is_a?(Array) ? val.join("\n") : val.to_s
+        end
+
+        normalized
+      end
     end
   end
 
@@ -107,52 +235,37 @@ module Filament
     def run(reactor, event, handle)
       case event
       when :read
-        chunk = read_request(context, handle)
+        context[:request] ||= Http::Request.new
+
+        chunk = read_chunk(handle, context)
+
         if chunk.nil?
           # puts "Client #{socket} gone on read"
           reactor.notify(handle, :disconnect)
-          return false
+          return
         else
-          process_request(context, chunk)
+          context[:request] << chunk
         end
       when :write
-        if read_done?(context)
-          run_app(context, handle)
-          write_response(context, handle)
+        if context[:request].complete?
+          run_app(handle, context)
+          write_response(handle, context)
           # puts "Notifying server about client #{socket} disconnect"
           reactor.notify(handle, :disconnect)
-          return false
+          return
         end
       end
 
       true
     end
 
-    def read_request(context, socket)
-      socket.gets(context[:content_length] ? context[:content_length] : "\r\n")
+    def read_chunk(socket, context)
+      content_length = context[:request].headers["CONTENT_LENGTH"]
+      socket.gets(content_length ? content_length : "\r\n")
     end
 
-    def read_done?(context)
-      case context[:method]
-      when "GET"
-        true
-      when "POST"
-        context[:request_buffer].bytesize == context[:content_length] 
-      else
-        false
-      end
-    end
-
-    def process_request(context, chunk)
-      context[:request_buffer] ||= ""
-      context[:request_buffer] += chunk
-      if chunk == "\r\n" || chunk == "\n"
-        consume_headers(context)
-      end
-    end
-
-    def write_response(context, socket)
-      ret = socket.write context[:response_buffer]
+    def write_response(socket, context)
+      ret = socket.write context[:response].to_s
       if ret.nil? || ret < 0
 	      # puts "Client is gone on write"
       else
@@ -160,122 +273,18 @@ module Filament
       end
     end
 
-    def run_app(context, socket)
-      env = rack_env(socket, context[:request_buffer]) 
+    def run_app(socket, context)
+      env = env(socket, context[:request]) 
       status, headers, body = context[:app].call(env)
-      context[:response_buffer] = Http::Response.new(status, headers, body).to_s
+      context[:response] = Http::Response.new(status, headers, body)
     end
 
-    module Http
-      class Response
-        def initialize(status, headers, body)
-          @status = "HTTP/1.1 #{status}"
-          @body = body.join
-          @headers = serialize_headers(headers.merge(content_length))
-        end
-
-        def headers
-          "#{@status}\r\n#{@headers}\r\n"
-        end
-
-        def body
-          @body
-        end
-
-        def to_s
-          "#{headers}#{body}"
-        end
-
-        private
-
-        def content_length
-          if @body.empty?
-            {}
-          else
-            { "Content-Length" => @body.bytesize.to_s }
-          end
-        end
-
-        def serialize_headers(headers)
-          head = ""
-
-          headers.each do |name, values|
-            case values
-            when String
-              values.each_line("\n") do |value|
-                head += "#{name}: #{value.chomp}\r\n"
-              end
-            when Time
-              # This is not RFC compliant, but mruby does not have
-              # #strftime on Time to produce #httpdate.
-              head += "#{name}: #{values.to_i}\r\n"
-            when Array
-              values.each do |value|
-                head += "#{name}: #{value}\r\n"
-              end
-            end
-          end
-
-          head
-        end
-      end
-    end
-
-    def rack_env(socket, body)
+    def env(socket, request)
       {
-        'rack.input' => body,
-        'rack.version' => "1.4.0", #Rack::VERSION,
-        'rack.errors' => $stderr,
-        'rack.multithread' => false,
-        'rack.multiprocess' => false,
-        'rack.run_once' => false,
-        'rack.url_scheme' => 'http',
-
-        'SERVER_SOFTWARE' => "Filament/0.0.1 (MRuby/#{RUBY_VERSION})",
+        'SERVER_SOFTWARE' => "Filament/#{VERSION} (#{RUBY_ENGINE}/#{RUBY_VERSION})",
         'APP_REQUEST_START' => Time.now.to_f,
         'SCRIPT_NAME' => ''
-      }
-    end
-
-    def consume_headers(request)
-      if RUBY_ENGINE == "mruby"
-        parser = Phr.new
-        parser.parse_request(request[:request_buffer])
-        request[:headers] = {}
-
-        parser.headers.each do |name, val|
-          key = name.dup
-          key.upcase!
-          key.tr!('-', '_')
-
-          unless ['content-type', 'content-length'].include?(name)
-            key = "HTTP_#{key}"
-          end
-
-          request[:headers][key] = val.is_a?(Array) ? val.join("\n") : val.to_s
-        end
-
-        request[:method] = parser.method.to_s
-        request[:path] = parser.path.split("?", 2)[0].to_s
-        request[:query_string] = parser.path.split("?", 2)[1].to_s
-        request[:content_length] = request[:headers]["CONTENT_LENGTH"].to_i
-        request[:server_protocol] = parser.minor_version
-
-        parser.reset
-      else
-        headers = {}
-
-        PicoHTTPParser.parse_http_request(request[:request_buffer], headers)
-
-        request[:headers] = headers
-        request[:method] = headers["REQUEST_METHOD"]
-        request[:path] = headers["PATH_INFO"]
-        request[:query_string] = headers["QUERY_STRING"]
-        request[:content_length] = headers["CONTENT_LENGTH"].to_i
-        request[:server_protocol] = headers['SERVER_PROTOCOL']
-      end
-
-      request[:request_buffer] = ""
+      }.merge(request.headers).merge(request.info)
     end
   end
 
@@ -326,19 +335,26 @@ module Filament
 end
 
 app = Proc.new do |env|
-  index=<<-EOF
-    <html>
-      <title>Hello from Filament HTTP server</title>
-      <body>
-      <h1>Hello</h1>
-      <p>Running on #{env['SERVER_SOFTWARE']}</p>
-      <p>Processing took #{((Time.now.to_f - env['APP_REQUEST_START']) * 1000.0).round(5)}ms.</p>
-      <p>Feel free to read the <a href="/_source">source code</a>.
-      </body>
-    </html>
-  EOF
+  case env['PATH']
+  when "/"
+    html=<<-EOF
+      <html>
+        <title>Hello from Filament HTTP server</title>
+        <body>
+        <h1>Hello</h1>
+        <p>Running on #{env['SERVER_SOFTWARE']}</p>
+        <p>Processing took #{((Time.now.to_f - env['APP_REQUEST_START']) * 1000.0).round(5)}ms.</p>
+        <p>Feel free to read the <a href="/_source">source code</a>.
+        </body>
+      </html>
+    EOF
 
-  [200, {'Content-Type': "text/html"}, [index]]
+    [200, {'Content-Type': "text/html"}, [html]]
+  when "/_source"
+    [200, {'Content-Type': "text/plain"}, [File.read(__FILE__)]]
+  else
+    [404, {'Content-Type': "text/plain"}, ["Not found"]]
+  end
 end
 
 Filament.run(app)
