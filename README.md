@@ -65,4 +65,3 @@
 
 - [Ruby Fiber documentation](https://ruby-doc.org/core-2.7.1/Fiber.html)
 - [Fiberchat](https://gist.github.com/pfleidi/835268) - A naive socket chat using select() and ruby fibers.
--
