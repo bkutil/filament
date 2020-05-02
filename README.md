@@ -6,11 +6,20 @@
 
 ## To do
 
-- Rack interface (Does rack handle posts payload)
-- Chunked encoding
+### HTTP
+
+- Rack interface (How does rack handle posts payload?)
 - Correct POST / GET payload handling.
-- MRB gem
+- Support for chunked encoding.
+
+### Code
+
+- MRB gem.
 - Perhaps split into separate gems.
+
+### Sockets
+
+- Learn about socket options.
 - Check correct connection handling with tcpdump.
 
 ## Dependencies
